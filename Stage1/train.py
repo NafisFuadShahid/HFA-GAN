@@ -280,6 +280,7 @@ def train(config):
         lambda_gdl=config.lambda_gdl,
         lambda_perceptual=config.lambda_perceptual,
         device=str(device),
+        medicalnet_weights=config.medicalnet_weights,
     ).to(device)
 
     # ---- Build Optimizer ----
@@ -324,7 +325,7 @@ def train(config):
     # ---- Training Loop ----
     timer = Timer()
     logger.log(f"\nStarting training for {config.num_epochs} epochs...")
-    logger.log(f"Loss weights: L1={config.lambda_l1}, GDL={config.lambda_gdl}, VGG={config.lambda_perceptual}")
+    logger.log(f"Loss weights: L1={config.lambda_l1}, GDL={config.lambda_gdl}, MedNet3D={config.lambda_perceptual}")
 
     for epoch in range(start_epoch + 1, config.num_epochs + 1):
         timer.start()

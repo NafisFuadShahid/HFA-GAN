@@ -12,10 +12,12 @@ from typing import List, Tuple
 @dataclass
 class Config:
     # ==================== PATHS ====================
-    # Raw data directories
-    data_dir_hr: str = "/mnt/Data/AKIB/CALSNIC2_T1W1_experiment/CALSNIC2_T1W1mm"    # 1mm high-res (target)
-    data_dir_lr: str = "/mnt/Data/AKIB/CALSNIC2_T1W1_experiment/CALSNIC2_T1W8mm"     # 8mm low-res (input)
-    split_dir: str = "/mnt/Data/AKIB/CALSNIC2_T1W1_experiment/dataset_split"          # Pre-made splits
+    # Base data directory (contains train/, val/, test/ with high_field/ and low_field/ subfolders)
+    data_root: str = "/mnt/Data/AKIB/CALSNIC2_T1W1_experiment/dataset_split/preprocessed/5_final"
+
+    # Subfolder names inside each split
+    hr_subfolder: str = "high_field"   # High-res target (T1w 1.0mm)
+    lr_subfolder: str = "low_field"    # Low-res input  (T1w 0.8mm)
 
     # Output directories
     output_dir: str = "./experiments/stage1"
@@ -47,7 +49,11 @@ class Config:
     # ==================== LOSS WEIGHTS ====================
     lambda_l1: float = 1.0         # L1 pixel loss weight
     lambda_gdl: float = 0.5        # Gradient Difference Loss weight
-    lambda_perceptual: float = 0.1  # Perceptual (VGG) loss weight
+    lambda_perceptual: float = 0.1  # Perceptual (MedicalNet 3D) loss weight
+
+    # MedicalNet 3D ResNet-50 pretrained on 23 medical datasets
+    # Download: https://github.com/Tencent/MedicalNet
+    medicalnet_weights: str = "./pretrained/resnet_50_23dataset.pth"
 
     # ==================== TRAINING ====================
     batch_size: int = 1            # 3D volumes are large, usually batch=1
