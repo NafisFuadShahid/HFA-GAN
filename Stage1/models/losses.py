@@ -5,15 +5,15 @@ Three losses combined:
 
 1. L1 Loss         - Pixel-wise accuracy (every voxel close to ground truth)
 2. GDL             - Gradient Difference Loss (edges must be sharp)
-3. Perceptual Loss - VGG feature similarity (structures must look correct)
+3. Perceptual Loss - MedicalNet 3D feature similarity (structures must look correct)
 
-Combined: L_S1 = λ_L1 * L1 + λ_GDL * GDL + λ_VGG * Perceptual
+Combined: L_S1 = λ_L1 * L1 + λ_GDL * GDL + λ_perc * MedicalNet3D_Perceptual
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import vgg16, VGG16_Weights
 
 
 # ==============================================================
@@ -98,149 +98,179 @@ class GradientDifferenceLoss(nn.Module):
 
 
 # ==============================================================
-# Loss 3: Perceptual Loss (VGG-16)
+# Loss 3: Perceptual Loss (MedicalNet 3D ResNet-50)
 # ==============================================================
+# Replaces VGG-16 2D perceptual loss.
+#
+# Why MedicalNet instead of VGG?
+#   - VGG is 2D: forces slicing 3D volumes → loses z-axis consistency
+#   - VGG trained on ImageNet: features capture "fur", "bricks" not tissue
+#   - MedicalNet is native 3D: single forward pass on (B,1,D,H,W)
+#   - MedicalNet trained on 23 medical datasets (8 MRI incl. brain)
+#   - Features capture anatomical boundaries (GM/WM/CSF), not objects
+#
+# Architecture: 3D ResNet-50 (Bottleneck) — frozen feature extractor
+# Weights: pretrained/resnet_50_23dataset.pth
+# Source: https://github.com/Tencent/MedicalNet
+# ==============================================================
+
+
+class _Bottleneck3D(nn.Module):
+    """3D Bottleneck residual block (matches MedicalNet architecture)."""
+    expansion = 4
+
+    def __init__(self, in_ch, mid_ch, stride=1, downsample=None):
+        super().__init__()
+        out_ch = mid_ch * self.expansion
+        self.conv1 = nn.Conv3d(in_ch, mid_ch, 1, bias=False)
+        self.bn1 = nn.BatchNorm3d(mid_ch)
+        self.conv2 = nn.Conv3d(mid_ch, mid_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm3d(mid_ch)
+        self.conv3 = nn.Conv3d(mid_ch, out_ch, 1, bias=False)
+        self.bn3 = nn.BatchNorm3d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        return self.relu(out + identity)
+
+
+class _MedicalNet3DResNet50(nn.Module):
+    """3D ResNet-50 matching MedicalNet's architecture exactly.
+    Used purely as a frozen feature extractor — no classification head."""
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv3d(1, 64, kernel_size=7, stride=(2, 2, 2),
+                               padding=(3, 3, 3), bias=False)
+        self.bn1 = nn.BatchNorm3d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
+
+        # [3, 4, 6, 3] bottleneck blocks — standard ResNet-50
+        self.layer1 = self._make_layer(64,   64,  3)
+        self.layer2 = self._make_layer(256,  128, 4, stride=2)
+        self.layer3 = self._make_layer(512,  256, 6, stride=2)
+        self.layer4 = self._make_layer(1024, 512, 3, stride=2)
+
+    def _make_layer(self, in_ch, mid_ch, num_blocks, stride=1):
+        out_ch = mid_ch * _Bottleneck3D.expansion
+        downsample = None
+        if stride != 1 or in_ch != out_ch:
+            downsample = nn.Sequential(
+                nn.Conv3d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm3d(out_ch),
+            )
+        layers = [_Bottleneck3D(in_ch, mid_ch, stride, downsample)]
+        for _ in range(1, num_blocks):
+            layers.append(_Bottleneck3D(out_ch, mid_ch))
+        return nn.Sequential(*layers)
+
+    def extract_features(self, x):
+        """Forward pass returning intermediate features from layer1-4.
+
+        For a 96³ input:
+          layer1 → (B,  256, 24, 24, 24)  — low-level: edges, tissue boundaries
+          layer2 → (B,  512, 12, 12, 12)  — mid-level: local anatomy, contrast
+          layer3 → (B, 1024,  6,  6,  6)  — high-level: regional structure
+          layer4 → (B, 2048,  3,  3,  3)  — semantic: global anatomy
+        """
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+        f1 = self.layer1(x)
+        f2 = self.layer2(f1)
+        f3 = self.layer3(f2)
+        f4 = self.layer4(f3)
+        return [f1, f2, f3, f4]
+
 
 class PerceptualLoss(nn.Module):
     """
-    Perceptual Loss using pre-trained VGG-16.
+    3D Perceptual Loss using MedicalNet ResNet-50.
 
-    The idea: instead of comparing pixels, compare how images "look"
-    at a higher level. VGG-16 was trained on millions of images to
-    recognize objects. Its internal features capture edges, textures,
-    and shapes - things that matter perceptually.
+    Pretrained on 23 medical segmentation datasets (8 MRI including
+    brain, 15 CT — ~110K annotated volumes). Features are anatomically
+    relevant for brain MRI (GM/WM/CSF boundaries, cortical folding).
 
-    How it works:
-      1. Pass both predicted and target through VGG-16
-      2. Extract features from intermediate layers
-      3. Compare features with L2 loss
+    Key advantages over VGG-16:
+      - Native 3D: single forward pass on (B, 1, D, H, W) — no slicing
+      - No channel replication: accepts 1-channel MRI directly
+      - Z-axis consistency: 3D convolutions preserve depth continuity
+      - Medical features: trained on brain MRI, not ImageNet
 
-    The 3D problem:
-      VGG-16 only works on 2D images. Our data is 3D.
-      Solution: extract 2D slices from all 3 anatomical planes
-      (axial, sagittal, coronal), compute perceptual loss on each,
-      and average.
+    Loss = Σ w_l * L1(φ_l(pred), φ_l(target))
+    where φ_l = frozen MedicalNet features at layer l.
 
-    Note: VGG expects 3-channel (RGB) input. For single-channel MRI,
-    we repeat the channel 3 times.
+    Layer weights [1.0, 1.0, 0.5, 0.25] downweight deeper layers
+    where CT-specific features may reside (conservative for MRI-only).
     """
 
-    def __init__(self, feature_layers=None, device="cuda"):
+    def __init__(self, weights_path=None, device="cuda",
+                 layer_weights=(1.0, 1.0, 0.5, 0.25)):
         super().__init__()
+        self.net = _MedicalNet3DResNet50()
+        self.layer_weights = list(layer_weights)
 
-        # Load pre-trained VGG-16 (frozen - we don't train it)
-        vgg = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features
-        vgg.eval()
+        # Load MedicalNet pretrained weights
+        if weights_path is not None and os.path.isfile(weights_path):
+            ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+            state = ckpt.get("state_dict", ckpt)
+            # Clean key names: remove "module." prefix, skip segmentation head
+            cleaned = {}
+            for k, v in state.items():
+                k_clean = k.replace("module.", "")
+                if k_clean.startswith(("conv_seg", "fc")):
+                    continue
+                cleaned[k_clean] = v
+            missing, unexpected = self.net.load_state_dict(cleaned, strict=False)
+            print(f"[MedicalNet3D] Loaded {len(cleaned)} keys from {weights_path}")
+            if missing:
+                print(f"  Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"  Unexpected keys: {len(unexpected)}")
+        else:
+            msg = weights_path or "None"
+            print(f"[MedicalNet3D] WARNING: No weights loaded (path={msg})")
+            print(f"  Download from: https://github.com/Tencent/MedicalNet")
+            print(f"  Expected at: ./pretrained/resnet_50_23dataset.pth")
 
-        # Which layers to extract features from
-        # These correspond to different levels of abstraction:
-        #   Layer 4  = early features (edges, corners)
-        #   Layer 9  = mid features (textures, patterns)
-        #   Layer 16 = deep features (shapes, parts)
-        if feature_layers is None:
-            feature_layers = [4, 9, 16]
-        self.feature_layers = feature_layers
+        # Freeze all weights — feature extractor only, not trainable
+        for p in self.net.parameters():
+            p.requires_grad = False
+        self.net.eval()
+        self.net.to(device)
 
-        # Split VGG into sub-networks at each extraction point
-        self.blocks = nn.ModuleList()
-        prev = 0
-        for layer_idx in feature_layers:
-            self.blocks.append(nn.Sequential(*list(vgg.children())[prev:layer_idx]))
-            prev = layer_idx
-
-        # Freeze all VGG weights
-        for param in self.parameters():
-            param.requires_grad = False
-
-        self.to(device)
-
-        # VGG expects images normalized with ImageNet stats
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-
-    def _normalize_for_vgg(self, x):
+    def forward(self, pred, target):
         """
-        Convert from our [-1, 1] range to VGG's expected range.
-        Also convert 1-channel to 3-channel.
-        """
-        # [-1, 1] -> [0, 1]
-        x = (x + 1.0) / 2.0
-
-        # 1-channel -> 3-channel (repeat grayscale)
-        if x.shape[1] == 1:
-            x = x.repeat(1, 3, 1, 1)
-
-        # Apply ImageNet normalization
-        x = (x - self.mean.to(x.device)) / self.std.to(x.device)
-        return x
-
-    def _extract_features(self, x):
-        """Extract VGG features at specified layers."""
-        features = []
-        for block in self.blocks:
-            x = block(x)
-            features.append(x)
-        return features
-
-    def _perceptual_2d(self, pred_2d, target_2d):
-        """Compute perceptual loss on a batch of 2D slices."""
-        pred_norm = self._normalize_for_vgg(pred_2d)
-        tgt_norm = self._normalize_for_vgg(target_2d)
-
-        pred_feats = self._extract_features(pred_norm)
-        tgt_feats = self._extract_features(tgt_norm)
-
-        loss = 0.0
-        for pf, tf in zip(pred_feats, tgt_feats):
-            loss += F.mse_loss(pf, tf)
-
-        return loss / len(pred_feats)
-
-    def forward(self, pred, target, num_slices=8):
-        """
-        Compute perceptual loss on 3D volumes by sampling 2D slices
-        from axial, sagittal, and coronal planes.
+        Compute 3D perceptual loss.
 
         Args:
-            pred: [B, C, D, H, W] predicted volume
-            target: [B, C, D, H, W] ground truth volume
-            num_slices: how many slices to sample per plane
+            pred:   [B, 1, D, H, W] — generator output
+            target: [B, 1, D, H, W] — ground truth
 
         Returns:
-            Average perceptual loss across all planes and slices.
+            Scalar perceptual loss (weighted L1 across 4 feature layers)
         """
-        B, C, D, H, W = pred.shape
-        total_loss = 0.0
-        count = 0
+        with torch.no_grad():
+            tgt_feats = self.net.extract_features(target)
+        pred_feats = self.net.extract_features(pred)
 
-        # Sample evenly-spaced slice indices
-        for plane in ["axial", "sagittal", "coronal"]:
-            if plane == "axial":
-                max_idx = D
-                get_slice = lambda vol, i: vol[:, :, i, :, :]  # [B, C, H, W]
-            elif plane == "sagittal":
-                max_idx = W
-                get_slice = lambda vol, i: vol[:, :, :, :, i]  # [B, C, D, H]
-            elif plane == "coronal":
-                max_idx = H
-                get_slice = lambda vol, i: vol[:, :, :, i, :]  # [B, C, D, W]
+        loss = 0.0
+        for w, pf, tf in zip(self.layer_weights, pred_feats, tgt_feats):
+            loss = loss + w * F.l1_loss(pf, tf.detach())
+        return loss
 
-            # Sample slice indices (evenly spaced, skip edges)
-            margin = max_idx // 8
-            indices = torch.linspace(margin, max_idx - margin - 1, num_slices).long()
-
-            for idx in indices:
-                pred_slice = get_slice(pred, idx)     # [B, C, ?, ?]
-                tgt_slice = get_slice(target, idx)     # [B, C, ?, ?]
-
-                # Resize to VGG's expected input size (224x224)
-                pred_resized = F.interpolate(pred_slice, size=(224, 224), mode="bilinear", align_corners=False)
-                tgt_resized = F.interpolate(tgt_slice, size=(224, 224), mode="bilinear", align_corners=False)
-
-                total_loss += self._perceptual_2d(pred_resized, tgt_resized)
-                count += 1
-
-        return total_loss / max(count, 1)
+    def train(self, mode=True):
+        """Override to keep MedicalNet always in eval mode."""
+        super().train(mode)
+        self.net.eval()
+        return self
 
 
 # ==============================================================
@@ -251,16 +281,16 @@ class Stage1Loss(nn.Module):
     """
     Combined loss for Stage 1 training.
 
-    L_S1 = λ_L1 * L1 + λ_GDL * GDL + λ_VGG * Perceptual
+    L_S1 = λ_L1 * L1 + λ_GDL * GDL + λ_perc * MedicalNet3D_Perceptual
 
     All three work together:
       - L1:         "make every voxel close to the real value"
       - GDL:        "make the edges as sharp as the real edges"
-      - Perceptual: "make the features look structurally similar"
+      - Perceptual: "make the 3D features look anatomically similar" (MedicalNet)
     """
 
     def __init__(self, lambda_l1=1.0, lambda_gdl=0.5, lambda_perceptual=0.1,
-                 device="cuda"):
+                 device="cuda", medicalnet_weights=None):
         super().__init__()
         self.lambda_l1 = lambda_l1
         self.lambda_gdl = lambda_gdl
@@ -269,9 +299,11 @@ class Stage1Loss(nn.Module):
         self.l1_loss = L1Loss()
         self.gdl_loss = GradientDifferenceLoss()
 
-        # Perceptual loss is optional (set lambda=0 to disable)
+        # MedicalNet 3D perceptual loss (set lambda=0 to disable)
         if lambda_perceptual > 0:
-            self.perceptual_loss = PerceptualLoss(device=device)
+            self.perceptual_loss = PerceptualLoss(
+                weights_path=medicalnet_weights, device=device
+            )
         else:
             self.perceptual_loss = None
 

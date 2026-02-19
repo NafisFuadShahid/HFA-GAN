@@ -193,111 +193,98 @@ class PairedNIfTIDataset(Dataset):
         return result_lr, result_hr
 
 
-def get_file_pairs(lr_dir, hr_dir, subject_list=None):
+def _extract_subject_key(filename):
     """
-    Match LR and HR files by filename.
+    Extract a subject key from a filename for matching LR<->HR pairs.
+
+    Filenames differ only in the resolution tag:
+      LR: CALSNIC2_EDM_C001_T1w08_V1.nii.gz
+      HR: CALSNIC2_EDM_C001_T1w10_V1.nii.gz
+
+    We strip the resolution part (T1w08 / T1w10) to get a common key:
+      -> CALSNIC2_EDM_C001__V1
+    """
+    import re
+    name = filename.replace(".nii.gz", "").replace(".nii", "")
+    # Remove T1wXX pattern (e.g. T1w08, T1w10) to create a resolution-agnostic key
+    key = re.sub(r"T1w\d+", "", name)
+    return key
+
+
+def get_file_pairs(lr_dir, hr_dir):
+    """
+    Match LR and HR files by subject key (handles different filenames).
+
+    LR files contain 'T1w08', HR files contain 'T1w10'. We match them
+    by stripping the resolution tag and comparing the remaining subject key.
 
     Args:
         lr_dir: Directory containing low-res NIfTI files.
         hr_dir: Directory containing high-res NIfTI files.
-        subject_list: Optional list of subject IDs to include.
-                      If None, uses all files found in lr_dir.
 
     Returns:
-        lr_paths, hr_paths: Matched lists of file paths.
+        lr_paths, hr_paths: Matched lists of file paths (sorted by subject key).
     """
-    # Find all NIfTI files in LR directory
+    # Find all NIfTI files
     lr_files = sorted(glob.glob(os.path.join(lr_dir, "*.nii.gz")))
     if not lr_files:
         lr_files = sorted(glob.glob(os.path.join(lr_dir, "*.nii")))
 
-    lr_paths = []
-    hr_paths = []
+    hr_files = sorted(glob.glob(os.path.join(hr_dir, "*.nii.gz")))
+    if not hr_files:
+        hr_files = sorted(glob.glob(os.path.join(hr_dir, "*.nii")))
 
-    for lr_path in lr_files:
-        fname = os.path.basename(lr_path)
-        hr_path = os.path.join(hr_dir, fname)
+    # Build lookup: subject_key -> filepath
+    lr_map = {_extract_subject_key(os.path.basename(f)): f for f in lr_files}
+    hr_map = {_extract_subject_key(os.path.basename(f)): f for f in hr_files}
 
-        # Check if matching HR file exists
-        if not os.path.exists(hr_path):
-            print(f"[Warning] No matching HR file for {fname}, skipping.")
-            continue
+    # Match by common keys
+    common_keys = sorted(set(lr_map.keys()) & set(hr_map.keys()))
 
-        # Filter by subject list if provided
-        if subject_list is not None:
-            subject_id = fname.replace(".nii.gz", "").replace(".nii", "")
-            if subject_id not in subject_list:
-                continue
+    lr_paths = [lr_map[k] for k in common_keys]
+    hr_paths = [hr_map[k] for k in common_keys]
 
-        lr_paths.append(lr_path)
-        hr_paths.append(hr_path)
+    unmatched_lr = set(lr_map.keys()) - set(hr_map.keys())
+    unmatched_hr = set(hr_map.keys()) - set(lr_map.keys())
+    if unmatched_lr:
+        print(f"[Warning] {len(unmatched_lr)} LR files have no matching HR file")
+    if unmatched_hr:
+        print(f"[Warning] {len(unmatched_hr)} HR files have no matching LR file")
 
     print(f"[Data] Found {len(lr_paths)} matched pairs in {lr_dir}")
     return lr_paths, hr_paths
-
-
-def load_subject_list(split_dir, split_name="train"):
-    """
-    Load a subject list from the split directory.
-    Expects files like: train.txt, val.txt, test.txt
-    Each line contains one subject ID.
-    """
-    split_file = os.path.join(split_dir, f"{split_name}.txt")
-    if not os.path.exists(split_file):
-        # Try .csv
-        split_file = os.path.join(split_dir, f"{split_name}.csv")
-    if not os.path.exists(split_file):
-        print(f"[Warning] Split file not found: {split_file}")
-        return None
-
-    with open(split_file, "r") as f:
-        subjects = [line.strip() for line in f.readlines() if line.strip()]
-
-    print(f"[Split] Loaded {len(subjects)} subjects for '{split_name}'")
-    return subjects
 
 
 def build_dataloaders(config):
     """
     Build train, validation, and test dataloaders from config.
 
+    Expects pre-split directory structure:
+      data_root/
+        train/  high_field/  low_field/
+        val/    high_field/  low_field/
+        test/   high_field/  low_field/
+
     Returns:
         train_loader, val_loader, test_loader
     """
-    # Try to load pre-made splits
-    train_subjects = load_subject_list(config.split_dir, "train")
-    val_subjects = load_subject_list(config.split_dir, "val")
-    test_subjects = load_subject_list(config.split_dir, "test")
+    # Build paths for each split
+    splits = {}
+    for split_name in ["train", "val", "test"]:
+        lr_dir = os.path.join(config.data_root, split_name, config.lr_subfolder)
+        hr_dir = os.path.join(config.data_root, split_name, config.hr_subfolder)
 
-    # Get file pairs
-    train_lr, train_hr = get_file_pairs(config.data_dir_lr, config.data_dir_hr, train_subjects)
-    val_lr, val_hr = get_file_pairs(config.data_dir_lr, config.data_dir_hr, val_subjects)
-    test_lr, test_hr = get_file_pairs(config.data_dir_lr, config.data_dir_hr, test_subjects)
+        if not os.path.isdir(lr_dir):
+            raise FileNotFoundError(f"LR directory not found: {lr_dir}")
+        if not os.path.isdir(hr_dir):
+            raise FileNotFoundError(f"HR directory not found: {hr_dir}")
 
-    # If no split files found, do a simple split
-    if not train_lr:
-        print("[Warning] No split files found. Doing automatic 60/20/10/10 split.")
-        all_lr, all_hr = get_file_pairs(config.data_dir_lr, config.data_dir_hr)
-        n = len(all_lr)
-        n_train = int(0.6 * n)
-        n_val = int(0.2 * n)
-        n_test1 = int(0.1 * n)
+        lr_paths, hr_paths = get_file_pairs(lr_dir, hr_dir)
+        splits[split_name] = (lr_paths, hr_paths)
 
-        # Shuffle with fixed seed for reproducibility
-        indices = list(range(n))
-        random.seed(42)
-        random.shuffle(indices)
-
-        train_idx = indices[:n_train]
-        val_idx = indices[n_train:n_train + n_val]
-        test_idx = indices[n_train + n_val:n_train + n_val + n_test1]
-
-        train_lr = [all_lr[i] for i in train_idx]
-        train_hr = [all_hr[i] for i in train_idx]
-        val_lr = [all_lr[i] for i in val_idx]
-        val_hr = [all_hr[i] for i in val_idx]
-        test_lr = [all_lr[i] for i in test_idx]
-        test_hr = [all_hr[i] for i in test_idx]
+    train_lr, train_hr = splits["train"]
+    val_lr, val_hr = splits["val"]
+    test_lr, test_hr = splits["test"]
 
     # Create datasets
     train_dataset = PairedNIfTIDataset(
